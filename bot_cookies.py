@@ -1972,6 +1972,35 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False):
     pagina = page
     data = {}
 
+    # ── Warm-up: visitar el visor para obtener ITVISORNOTISESSION ──
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as warmup_client:
+        warmup_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+            "Cookie": cookie_header,
+        }
+        # Probar las URLs candidatas del visor hasta encontrar una que funcione
+        for warmup_url in [
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/",
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/index.jsp",
+        ]:
+            try:
+                wr = await warmup_client.get(warmup_url, headers=warmup_headers)
+                logger.info(f"[Buzon] Warm-up {warmup_url} → {wr.status_code} | cookies nuevas: {list(wr.cookies.keys())}")
+                # Absorber cookies nuevas
+                for name, value in wr.cookies.items():
+                    cookies[name] = value
+                cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                headers["Cookie"] = cookie_header
+                warmup_headers["Cookie"] = cookie_header
+                if wr.status_code == 200:
+                    break
+            except Exception as e:
+                logger.warning(f"[Buzon] Warm-up error: {e}")
+    # ──────────────────────────────────────────────────────────────
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
         while True:
             params = {
