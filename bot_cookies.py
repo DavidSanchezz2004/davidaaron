@@ -1562,6 +1562,119 @@ async def get_cookies(token: str):
     )
 
 
+@app.get("/buzon/{token}")
+async def buzon_listar(token: str, page: int = 1, todo: bool = False):
+    """Lista el buzón electrónico usando las cookies de una sesión activa."""
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+        "Cookie": cookie_header,
+    }
+
+    todos_mensajes = []
+    pagina = page
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
+        while True:
+            params = {
+                "tipoMsj": 2, "codCarpeta": "00", "codEtiqueta": "",
+                "page": pagina, "des_asunto": "", "codMensaje": "",
+                "tipoOrden": "NADA", "_": str(int(datetime.now().timestamp() * 1000)),
+            }
+            r = await client.get(
+                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/listNotiMenPag",
+                params=params, headers=headers,
+            )
+            data = r.json()
+            rows = data.get("rows")
+
+            if rows is None:
+                return JSONResponse(content={
+                    "ok": False, "error": "rows_null",
+                    "detalle": "Sesión inválida o RUC sin buzón",
+                    "ruc": session.get("ruc"),
+                })
+
+            todos_mensajes.extend(rows)
+
+            if not todo or len(rows) < 25:
+                break
+            pagina += 1
+
+    return {
+        "ok": True,
+        "ruc": session.get("ruc"),
+        "total_obtenidos": len(todos_mensajes),
+        "total_buzon": data.get("records", 0),
+        "pagina": pagina,
+        "mensajes": todos_mensajes,
+    }
+
+
+@app.get("/buzon/{token}/detalle/{codigo_mensaje}")
+async def buzon_detalle(token: str, codigo_mensaje: int):
+    """Obtiene el detalle de un mensaje del buzón."""
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+        "Cookie": cookie_header,
+    }
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
+        r = await client.get(
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerDetalleNotiMen",
+            params={"codigoMensaje": codigo_mensaje, "tipoMsj": 2,
+                    "_": str(int(datetime.now().timestamp() * 1000))},
+            headers=headers,
+        )
+    data = r.json()
+
+    # Parsear msjMensaje automáticamente
+    msj_raw = data.get("msjMensaje", "")
+    if msj_raw and isinstance(msj_raw, str):
+        try:
+            data["msjMensaje_parsed"] = json.loads(msj_raw)
+        except Exception:
+            data["msjMensaje_parsed"] = msj_raw
+
+    # Clasificar adjuntos
+    adjuntos = data.get("listAttach", [])
+    data["adjuntos_clasificados"] = {
+        "documento_html": next(({"numId": a.get("numId")} for a in adjuntos if str(a.get("indMensaje")) == "3"), None),
+        "archivos_pdf": [
+            {"codArchivo": a.get("codArchivo"), "nomArchivo": a.get("nomArchivo"),
+             "tamano": a.get("tamanoArchivoFormat"), "bytes": a.get("cntTamarch")}
+            for a in adjuntos if str(a.get("indMensaje")) == "2"
+        ],
+    }
+
+    return {"ok": True, "ruc": session.get("ruc"), "detalle": data}
+
+
 @app.get("/ext-inject/{token}", response_class=HTMLResponse)
 async def ext_inject(token: str):
     """Página de aterrizaje para la extensión Chrome.
