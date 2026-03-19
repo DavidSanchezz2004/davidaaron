@@ -1963,7 +1963,8 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False):
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "es-ES,es;q=0.9",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+        "Origin": "https://ww1.sunat.gob.pe",
+        "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
         "Cookie": cookie_header,
     }
 
@@ -2037,7 +2038,8 @@ async def buzon_detalle(token: str, codigo_mensaje: int):
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "es-ES,es;q=0.9",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+        "Origin": "https://ww1.sunat.gob.pe",
+        "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
         "Cookie": cookie_header,
     }
 
