@@ -1346,25 +1346,20 @@ async def _do_login(creds: Credenciales) -> dict:
         # del usuario será quien abra luego el URL OAuth de Declaración y Pago
         # (SUNAT_DECLARACION_LOGIN_URL) con esas mismas cookies.
 
-        # ── Warm-up visor desde contexto autenticado ─────────────────
-        try:
-            logger.info(f"[{rid}] Warm-up visor...")
-            for visor_url in [
-                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/",
-                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/index.jsp",
-            ]:
-                resp_v = await page.goto(
-                    visor_url,
-                    wait_until="domcontentloaded",
-                    timeout=PW_NAV_TIMEOUT,
-                )
-                if resp_v and resp_v.status == 200:
-                    await page.wait_for_timeout(800)
-                    logger.info(f"[{rid}] Visor OK en {visor_url}")
-                    break
-                logger.info(f"[{rid}] Visor {visor_url} → {resp_v.status if resp_v else '?'}")
-        except Exception as e:
-            logger.warning(f"[{rid}] Warm-up visor error: {e}")
+        # ── Warm-up visor: hacer clic en Buzón desde el menú ─────────
+        if creds.portal == "sunat":
+            try:
+                logger.info(f"[{rid}] Warm-up visor via clic en Buzón Electrónico...")
+                await page.goto(SUNAT_MENU_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
+                await page.wait_for_timeout(2000)
+                await page.click("#aOpcionBuzon")
+                await page.wait_for_timeout(3000)
+                all_c = await context.cookies()
+                visor_c = [c for c in all_c if "VISOR" in c["name"]]
+                logger.info(f"[{rid}] Cookies VISOR tras clic: {[c['name'] for c in visor_c]}")
+                logger.info(f"[{rid}] URL tras clic: {page.url}")
+            except Exception as e:
+                logger.warning(f"[{rid}] Warm-up visor error: {e}")
         # ─────────────────────────────────────────────────────────────
 
         all_cookies = await context.cookies()
