@@ -201,7 +201,7 @@ def get_client_ip(request: Request) -> str:
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     public = ["/health", "/", "/docs", "/openapi.json"]
-    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/")
+    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/buzon/")
     if request.url.path.startswith(public_prefixes) or request.url.path in public:
         return await call_next(request)
     if request.headers.get("x-api-key") != API_KEY:
@@ -212,7 +212,7 @@ async def auth_middleware(request: Request, call_next):
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     public = ["/health", "/", "/docs", "/openapi.json"]
-    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/")
+    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/buzon/")
     if request.url.path.startswith(public_prefixes) or request.url.path in public:
         return await call_next(request)
     ip = get_client_ip(request)
@@ -1338,79 +1338,6 @@ async def _do_login(creds: Credenciales) -> dict:
                 return {"ok": False, "error": "credenciales_invalidas", "detalle": _normalize(last_err)}
             return {"ok": False, "error": "login_timeout", "detalle": f"URL: {page.url}"}
 
-        # ── Warm-up visor: genera ITVISORNOTISESSION ─────────────────────────────
-        if creds.portal == "sunat":
-            try:
-                VISOR_MASTER = "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master"
-                logger.info(f"[{rid}] Navegando al visor para ITVISORNOTISESSION...")
-
-                resp_visor = await page.goto(
-                    VISOR_MASTER,
-                    wait_until="domcontentloaded",
-                    timeout=PW_NAV_TIMEOUT,
-                )
-
-                await page.wait_for_timeout(1200)
-
-                # ── DIAGNÓSTICO: ver URL final y status ──────────────────────────
-                final_url = page.url
-                status    = resp_visor.status if resp_visor else "?"
-                logger.info(f"[{rid}] Visor status={status} | URL final={final_url}")
-
-                # ¿Redirigió al login? → el RUC no tiene acceso al visor
-                if "loginMenuSol" in final_url or "api-seguridad" in final_url:
-                    logger.warning(f"[{rid}] ⚠️  Visor redirigió al login — RUC sin acceso al buzón electrónico")
-                else:
-                    # ── Capturar todas las cookies del contexto post-visor ───────
-                    all_post = await context.cookies()
-                    visor_cookies = [c for c in all_post if "VISOR" in c["name"] or "visor" in c["name"].lower()]
-                    ww1_cookies   = [c for c in all_post if "ww1.sunat.gob.pe" in c.get("domain", "")]
-
-                    logger.info(f"[{rid}] Cookies con 'VISOR' tras warm-up: {[c['name'] for c in visor_cookies]}")
-                    logger.info(f"[{rid}] Todas las cookies de ww1 tras warm-up: {[c['name']+'@'+c['domain'] for c in ww1_cookies]}")
-
-                    if visor_cookies:
-                        logger.info(f"[{rid}] Warm-up visor OK ✅ — ITVISORNOTISESSION obtenida")
-                    else:
-                        # ── Intentar click en el enlace del buzón desde el menú ──
-                        # Algunos RUCs necesitan navegar desde e-menu, no directo
-                        logger.warning(f"[{rid}] ITVISORNOTISESSION no llegó con goto directo — intentando desde menú...")
-
-                        await page.goto(
-                            "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
-                            wait_until="domcontentloaded",
-                            timeout=PW_NAV_TIMEOUT,
-                        )
-                        await page.wait_for_timeout(1000)
-
-                        # Buscar el link del buzón en el menú SOL
-                        buzon_link = page.locator(
-                            "a[href*='itvisornoti'], a[href*='visor'], a[href*='buzon'], a[href*='notif']"
-                        ).first
-                        if await buzon_link.count() > 0:
-                            logger.info(f"[{rid}] Link buzón encontrado — haciendo click...")
-                            await buzon_link.click()
-                            await page.wait_for_timeout(1500)
-
-                            final_url2 = page.url
-                            logger.info(f"[{rid}] URL tras click buzón: {final_url2}")
-
-                            all_post2 = await context.cookies()
-                            visor_cookies2 = [c for c in all_post2 if "VISOR" in c["name"]]
-                            logger.info(f"[{rid}] Cookies VISOR tras click: {[c['name'] for c in visor_cookies2]}")
-                        else:
-                            logger.warning(f"[{rid}] Link buzón no encontrado en el menú")
-                            # Listar todos los links para debug
-                            links = await page.eval_on_selector_all(
-                                "a[href]",
-                                "els => els.map(e => e.href).filter(h => h.includes('sunat'))",
-                            )
-                            logger.info(f"[{rid}] Links SUNAT disponibles en menú: {links[:10]}")
-
-            except Exception as e:
-                logger.warning(f"[{rid}] Warm-up visor error: {e}")
-        # ─────────────────────────────────────────────────────────────────────────
-
         # Esperar que SUNAT termine de generar las cookies base
         await page.wait_for_timeout(1500)
 
@@ -1560,119 +1487,6 @@ async def get_cookies(token: str):
         },
         headers={"ngrok-skip-browser-warning": "true"},
     )
-
-
-@app.get("/buzon/{token}")
-async def buzon_listar(token: str, page: int = 1, todo: bool = False):
-    """Lista el buzón electrónico usando las cookies de una sesión activa."""
-    session = proxy_sessions.get(token)
-    if not session:
-        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
-    if session["expires_at"] <= datetime.now():
-        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
-
-    cookies = {c["name"]: c["value"] for c in session["cookies"]}
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "es-ES,es;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
-        "Cookie": cookie_header,
-    }
-
-    todos_mensajes = []
-    pagina = page
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
-        while True:
-            params = {
-                "tipoMsj": 2, "codCarpeta": "00", "codEtiqueta": "",
-                "page": pagina, "des_asunto": "", "codMensaje": "",
-                "tipoOrden": "NADA", "_": str(int(datetime.now().timestamp() * 1000)),
-            }
-            r = await client.get(
-                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/listNotiMenPag",
-                params=params, headers=headers,
-            )
-            data = r.json()
-            rows = data.get("rows")
-
-            if rows is None:
-                return JSONResponse(content={
-                    "ok": False, "error": "rows_null",
-                    "detalle": "Sesión inválida o RUC sin buzón",
-                    "ruc": session.get("ruc"),
-                })
-
-            todos_mensajes.extend(rows)
-
-            if not todo or len(rows) < 25:
-                break
-            pagina += 1
-
-    return {
-        "ok": True,
-        "ruc": session.get("ruc"),
-        "total_obtenidos": len(todos_mensajes),
-        "total_buzon": data.get("records", 0),
-        "pagina": pagina,
-        "mensajes": todos_mensajes,
-    }
-
-
-@app.get("/buzon/{token}/detalle/{codigo_mensaje}")
-async def buzon_detalle(token: str, codigo_mensaje: int):
-    """Obtiene el detalle de un mensaje del buzón."""
-    session = proxy_sessions.get(token)
-    if not session:
-        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
-    if session["expires_at"] <= datetime.now():
-        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
-
-    cookies = {c["name"]: c["value"] for c in session["cookies"]}
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "es-ES,es;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
-        "Cookie": cookie_header,
-    }
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
-        r = await client.get(
-            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerDetalleNotiMen",
-            params={"codigoMensaje": codigo_mensaje, "tipoMsj": 2,
-                    "_": str(int(datetime.now().timestamp() * 1000))},
-            headers=headers,
-        )
-    data = r.json()
-
-    # Parsear msjMensaje automáticamente
-    msj_raw = data.get("msjMensaje", "")
-    if msj_raw and isinstance(msj_raw, str):
-        try:
-            data["msjMensaje_parsed"] = json.loads(msj_raw)
-        except Exception:
-            data["msjMensaje_parsed"] = msj_raw
-
-    # Clasificar adjuntos
-    adjuntos = data.get("listAttach", [])
-    data["adjuntos_clasificados"] = {
-        "documento_html": next(({"numId": a.get("numId")} for a in adjuntos if str(a.get("indMensaje")) == "3"), None),
-        "archivos_pdf": [
-            {"codArchivo": a.get("codArchivo"), "nomArchivo": a.get("nomArchivo"),
-             "tamano": a.get("tamanoArchivoFormat"), "bytes": a.get("cntTamarch")}
-            for a in adjuntos if str(a.get("indMensaje")) == "2"
-        ],
-    }
-
-    return {"ok": True, "ruc": session.get("ruc"), "detalle": data}
 
 
 @app.get("/ext-inject/{token}", response_class=HTMLResponse)
@@ -2132,6 +1946,123 @@ async def root():
             "sunafil":     "Casilla Electrónica SUNAFIL (casillaelectronica.sunafil.gob.pe)",
         },
     }
+
+
+@app.get("/buzon/{token}")
+async def buzon_listar(token: str, page: int = 1, todo: bool = False):
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+        "Cookie": cookie_header,
+    }
+
+    todos_mensajes = []
+    pagina = page
+    data = {}
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
+        while True:
+            params = {
+                "tipoMsj": 2, "codCarpeta": "00", "codEtiqueta": "",
+                "page": pagina, "des_asunto": "", "codMensaje": "",
+                "tipoOrden": "NADA",
+                "_": str(int(datetime.now().timestamp() * 1000)),
+            }
+            r = await client.get(
+                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/listNotiMenPag",
+                params=params, headers=headers,
+            )
+            data = r.json()
+            rows = data.get("rows")
+
+            if rows is None:
+                return JSONResponse(content={
+                    "ok": False, "error": "rows_null",
+                    "detalle": "Sesión inválida o RUC sin buzón",
+                    "ruc": session.get("ruc"),
+                })
+
+            todos_mensajes.extend(rows)
+            if not todo or len(rows) < 25:
+                break
+            pagina += 1
+
+    return {
+        "ok": True,
+        "ruc": session.get("ruc"),
+        "total_obtenidos": len(todos_mensajes),
+        "total_buzon": data.get("records", 0),
+        "pagina": pagina,
+        "mensajes": todos_mensajes,
+    }
+
+
+@app.get("/buzon/{token}/detalle/{codigo_mensaje}")
+async def buzon_detalle(token: str, codigo_mensaje: int):
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+        "Cookie": cookie_header,
+    }
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
+        r = await client.get(
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerDetalleNotiMen",
+            params={
+                "codigoMensaje": codigo_mensaje, "tipoMsj": 2,
+                "_": str(int(datetime.now().timestamp() * 1000)),
+            },
+            headers=headers,
+        )
+    data = r.json()
+
+    msj_raw = data.get("msjMensaje", "")
+    if msj_raw and isinstance(msj_raw, str):
+        try:
+            data["msjMensaje_parsed"] = json.loads(msj_raw)
+        except Exception:
+            data["msjMensaje_parsed"] = msj_raw
+
+    adjuntos = data.get("listAttach", [])
+    data["adjuntos_clasificados"] = {
+        "documento_html": next(
+            ({"numId": a.get("numId")} for a in adjuntos if str(a.get("indMensaje")) == "3"),
+            None
+        ),
+        "archivos_pdf": [
+            {
+                "codArchivo": a.get("codArchivo"),
+                "nomArchivo": a.get("nomArchivo"),
+                "tamano": a.get("tamanoArchivoFormat"),
+                "bytes": a.get("cntTamarch"),
+            }
+            for a in adjuntos if str(a.get("indMensaje")) == "2"
+        ],
+    }
+
+    return {"ok": True, "ruc": session.get("ruc"), "detalle": data}
 
 
 if __name__ == "__main__":
