@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Iniciando sesión…</title>
+    <style>
+      body {
+        font-family:
+          system-ui,
+          Segoe UI,
+          Roboto,
+          Arial;
+        display: grid;
+        place-items: center;
+        height: 100vh;
+        margin: 0;
+        background: #f7f7f7;
+      }
+      .card {
+        background: #fff;
+        padding: 22px 24px;
+        border-radius: 14px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+        width: min(520px, 92vw);
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 20px;
+      }
+      p {
+        margin: 0;
+        color: #444;
+      }
+      .small {
+        margin-top: 10px;
+        font-size: 13px;
+        color: #777;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Iniciando sesión en SUNAT…</h1>
+      <p>Por favor espere, será redirigido automáticamente.</p>
+      <div class="small" id="dbg"></div>
+    </div>
+
+    <script>
+      // SOLO prueba el redirect (sin login)
+      const target =
+        "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*";
+      document.getElementById("dbg").textContent = "Redirigiendo a: " + target;
+
+      setTimeout(() => {
+        window.location.replace(target);
+      }, 900);
+    </script>
+  </body>
+</html>

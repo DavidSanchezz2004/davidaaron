@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# Sensitive runtime state (cookies/sessions)
+proxy_sessions.json
+

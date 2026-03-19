@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Mendieta - Acceso SUNAT",
+  "version": "2.9",
+  "description": "Portal Mendieta — Acceso automático y seguro al portal SUNAT",
+
+  "permissions": ["cookies", "tabs", "storage"],
+
+  "host_permissions": [
+    "*://*.sunat.gob.pe/*",
+    "*://*.sunafil.gob.pe/*",
+    "https://viveactivo-sunat-proxy.flyoes.easypanel.host/*",
+    "http://localhost/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["spinner.html", "LogoMendieta.png"],
+      "matches": ["https://*/*"]
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Mendieta - Acceso SUNAT"
+  }
+}
