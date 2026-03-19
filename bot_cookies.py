@@ -1346,6 +1346,27 @@ async def _do_login(creds: Credenciales) -> dict:
         # del usuario será quien abra luego el URL OAuth de Declaración y Pago
         # (SUNAT_DECLARACION_LOGIN_URL) con esas mismas cookies.
 
+        # ── Warm-up visor desde contexto autenticado ─────────────────
+        try:
+            logger.info(f"[{rid}] Warm-up visor...")
+            for visor_url in [
+                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/",
+                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/index.jsp",
+            ]:
+                resp_v = await page.goto(
+                    visor_url,
+                    wait_until="domcontentloaded",
+                    timeout=PW_NAV_TIMEOUT,
+                )
+                if resp_v and resp_v.status == 200:
+                    await page.wait_for_timeout(800)
+                    logger.info(f"[{rid}] Visor OK en {visor_url}")
+                    break
+                logger.info(f"[{rid}] Visor {visor_url} → {resp_v.status if resp_v else '?'}")
+        except Exception as e:
+            logger.warning(f"[{rid}] Warm-up visor error: {e}")
+        # ─────────────────────────────────────────────────────────────
+
         all_cookies = await context.cookies()
         cookies = _filter_cookies(all_cookies, domains)
         cookie_names = [f"{c['name']}@{c['domain']}" for c in cookies]
