@@ -1983,6 +1983,14 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False):
                 "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/listNotiMenPag",
                 params=params, headers=headers,
             )
+
+            # ── LOGGING DETALLADO ──────────────────────────────────────
+            logger.info(f"[Buzon] HTTP {r.status_code} | URL final: {r.url}")
+            logger.info(f"[Buzon] Content-Type: {r.headers.get('content-type', '')}")
+            logger.info(f"[Buzon] Respuesta: {r.text[:500]}")
+            logger.info(f"[Buzon] Cookies enviadas: {list(cookies.keys())}")
+            # ──────────────────────────────────────────────────────────
+
             data = r.json()
             rows = data.get("rows")
 
@@ -1991,6 +1999,12 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False):
                     "ok": False, "error": "rows_null",
                     "detalle": "Sesión inválida o RUC sin buzón",
                     "ruc": session.get("ruc"),
+                    "debug": {
+                        "status": r.status_code,
+                        "url_final": str(r.url),
+                        "content_type": r.headers.get("content-type", ""),
+                        "respuesta": r.text[:500],
+                    }
                 })
 
             todos_mensajes.extend(rows)
