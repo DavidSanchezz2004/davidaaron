@@ -1341,16 +1341,74 @@ async def _do_login(creds: Credenciales) -> dict:
         # ── Warm-up visor: genera ITVISORNOTISESSION ─────────────────────────────
         if creds.portal == "sunat":
             try:
+                VISOR_MASTER = "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master"
                 logger.info(f"[{rid}] Navegando al visor para ITVISORNOTISESSION...")
-                await page.goto(
-                    "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+
+                resp_visor = await page.goto(
+                    VISOR_MASTER,
                     wait_until="domcontentloaded",
                     timeout=PW_NAV_TIMEOUT,
                 )
-                await page.wait_for_timeout(800)
-                logger.info(f"[{rid}] Warm-up visor OK ✅")
+
+                await page.wait_for_timeout(1200)
+
+                # ── DIAGNÓSTICO: ver URL final y status ──────────────────────────
+                final_url = page.url
+                status    = resp_visor.status if resp_visor else "?"
+                logger.info(f"[{rid}] Visor status={status} | URL final={final_url}")
+
+                # ¿Redirigió al login? → el RUC no tiene acceso al visor
+                if "loginMenuSol" in final_url or "api-seguridad" in final_url:
+                    logger.warning(f"[{rid}] ⚠️  Visor redirigió al login — RUC sin acceso al buzón electrónico")
+                else:
+                    # ── Capturar todas las cookies del contexto post-visor ───────
+                    all_post = await context.cookies()
+                    visor_cookies = [c for c in all_post if "VISOR" in c["name"] or "visor" in c["name"].lower()]
+                    ww1_cookies   = [c for c in all_post if "ww1.sunat.gob.pe" in c.get("domain", "")]
+
+                    logger.info(f"[{rid}] Cookies con 'VISOR' tras warm-up: {[c['name'] for c in visor_cookies]}")
+                    logger.info(f"[{rid}] Todas las cookies de ww1 tras warm-up: {[c['name']+'@'+c['domain'] for c in ww1_cookies]}")
+
+                    if visor_cookies:
+                        logger.info(f"[{rid}] Warm-up visor OK ✅ — ITVISORNOTISESSION obtenida")
+                    else:
+                        # ── Intentar click en el enlace del buzón desde el menú ──
+                        # Algunos RUCs necesitan navegar desde e-menu, no directo
+                        logger.warning(f"[{rid}] ITVISORNOTISESSION no llegó con goto directo — intentando desde menú...")
+
+                        await page.goto(
+                            "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+                            wait_until="domcontentloaded",
+                            timeout=PW_NAV_TIMEOUT,
+                        )
+                        await page.wait_for_timeout(1000)
+
+                        # Buscar el link del buzón en el menú SOL
+                        buzon_link = page.locator(
+                            "a[href*='itvisornoti'], a[href*='visor'], a[href*='buzon'], a[href*='notif']"
+                        ).first
+                        if await buzon_link.count() > 0:
+                            logger.info(f"[{rid}] Link buzón encontrado — haciendo click...")
+                            await buzon_link.click()
+                            await page.wait_for_timeout(1500)
+
+                            final_url2 = page.url
+                            logger.info(f"[{rid}] URL tras click buzón: {final_url2}")
+
+                            all_post2 = await context.cookies()
+                            visor_cookies2 = [c for c in all_post2 if "VISOR" in c["name"]]
+                            logger.info(f"[{rid}] Cookies VISOR tras click: {[c['name'] for c in visor_cookies2]}")
+                        else:
+                            logger.warning(f"[{rid}] Link buzón no encontrado en el menú")
+                            # Listar todos los links para debug
+                            links = await page.eval_on_selector_all(
+                                "a[href]",
+                                "els => els.map(e => e.href).filter(h => h.includes('sunat'))",
+                            )
+                            logger.info(f"[{rid}] Links SUNAT disponibles en menú: {links[:10]}")
+
             except Exception as e:
-                logger.warning(f"[{rid}] Warm-up visor falló (no crítico): {e}")
+                logger.warning(f"[{rid}] Warm-up visor error: {e}")
         # ─────────────────────────────────────────────────────────────────────────
 
         # Esperar que SUNAT termine de generar las cookies base
