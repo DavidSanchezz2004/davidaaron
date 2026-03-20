@@ -1965,12 +1965,14 @@ async def root():
 
 
 @app.get("/buzon/{token}")
-async def buzon_listar(token: str, page: int = 1, todo: bool = False):
+async def buzon_listar(token: str, page: int = 1, todo: bool = False, tipo: int = 2, desde: str = ""):
     session = proxy_sessions.get(token)
     if not session:
         return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
     if session["expires_at"] <= datetime.now():
         return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    from datetime import datetime as dt
 
     cookies = {c["name"]: c["value"] for c in session["cookies"]}
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
@@ -1983,10 +1985,6 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False):
         "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
         "Cookie": cookie_header,
     }
-
-    todos_mensajes = []
-    pagina = page
-    data = {}
 
     # ── Warm-up: visitar el visor para obtener ITVISORNOTISESSION ──
     async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as warmup_client:
@@ -2017,10 +2015,21 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False):
                 logger.warning(f"[Buzon] Warm-up error: {e}")
     # ──────────────────────────────────────────────────────────────
 
+    todos_mensajes = []
+    pagina = page
+    data = {}
+    fecha_desde = None
+
+    if desde:
+        try:
+            fecha_desde = dt.strptime(desde, "%Y-%m-%d")
+        except Exception:
+            pass
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
         while True:
             params = {
-                "tipoMsj": 2, "codCarpeta": "00", "codEtiqueta": "",
+                "tipoMsj": tipo, "codCarpeta": "00", "codEtiqueta": "",
                 "page": pagina, "des_asunto": "", "codMensaje": "",
                 "tipoOrden": "NADA",
                 "_": str(int(datetime.now().timestamp() * 1000)),
@@ -2030,12 +2039,10 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False):
                 params=params, headers=headers,
             )
 
-            # ── LOGGING DETALLADO ──────────────────────────────────────
             logger.info(f"[Buzon] HTTP {r.status_code} | URL final: {r.url}")
             logger.info(f"[Buzon] Content-Type: {r.headers.get('content-type', '')}")
             logger.info(f"[Buzon] Respuesta: {r.text[:500]}")
             logger.info(f"[Buzon] Cookies enviadas: {list(cookies.keys())}")
-            # ──────────────────────────────────────────────────────────
 
             data = r.json()
             rows = data.get("rows")
@@ -2053,7 +2060,27 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False):
                     }
                 })
 
-            todos_mensajes.extend(rows)
+            # ── Filtrar por fecha si se especificó "desde" ──────────────
+            if fecha_desde:
+                rows_validos = []
+                hay_anteriores = False
+                for m in rows:
+                    try:
+                        fec = dt.strptime(m.get("fecEnvio", "01/01/1900"), "%d/%m/%Y")
+                        if fec >= fecha_desde:
+                            rows_validos.append(m)
+                        else:
+                            hay_anteriores = True
+                    except Exception:
+                        rows_validos.append(m)
+                todos_mensajes.extend(rows_validos)
+                # Si encontramos mensajes anteriores → parar paginación
+                if hay_anteriores:
+                    break
+            else:
+                todos_mensajes.extend(rows)
+            # ────────────────────────────────────────────────────────────
+
             if not todo or len(rows) < 25:
                 break
             pagina += 1
