@@ -2126,6 +2126,86 @@ async def buzon_detalle(token: str, codigo_mensaje: int):
     return {"ok": True, "ruc": session.get("ruc"), "detalle": data}
 
 
+@app.get("/buzon/{token}/documento/{cod_mensaje}")
+async def buzon_documento(token: str, cod_mensaje: int):
+    """Descarga el documento HTML principal del mensaje."""
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    headers_base = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+        "Cookie": cookie_header,
+    }
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30, verify=False) as client:
+        # Obtener detalle para sacar la URL del documento
+        r = await client.get(
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerDetalleNotiMen",
+            params={"codigoMensaje": cod_mensaje, "tipoMsj": 2,
+                    "_": str(int(datetime.now().timestamp() * 1000))},
+            headers={**headers_base, "Accept": "application/json, text/javascript, */*; q=0.01",
+                     "X-Requested-With": "XMLHttpRequest"},
+        )
+        detalle = r.json()
+        url_doc = detalle.get("url", "")
+
+        if not url_doc:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "sin_url_documento"})
+
+        full_url = f"https://ww1.sunat.gob.pe{url_doc}" if url_doc.startswith("/") else url_doc
+        rd = await client.get(full_url, headers={
+            **headers_base,
+            "Accept": "text/html,application/xhtml+xml,*/*",
+        })
+
+    return Response(
+        content=rd.content,
+        media_type=rd.headers.get("content-type", "text/html"),
+        headers={"Content-Disposition": f"inline; filename=doc_{cod_mensaje}.html"},
+    )
+
+
+@app.get("/buzon/{token}/pdf/{cod_mensaje}/{cod_archivo}")
+async def buzon_pdf(token: str, cod_mensaje: int, cod_archivo: int):
+    """Descarga el PDF adjunto de un mensaje."""
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    url = (
+        f"https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerArchivo"
+        f"?codArchivo={cod_archivo}&nomArchivo=adjunto_{cod_mensaje}"
+    )
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30, verify=False) as client:
+        r = await client.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/pdf,application/octet-stream,*/*",
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+            "Cookie": cookie_header,
+        })
+
+    nom = f"doc_{cod_mensaje}_{cod_archivo}.pdf"
+    return Response(
+        content=r.content,
+        media_type=r.headers.get("content-type", "application/pdf"),
+        headers={"Content-Disposition": f"attachment; filename={nom}"},
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     host = os.environ.get("COOKIES_HOST", "127.0.0.1")
