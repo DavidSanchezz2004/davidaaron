@@ -1292,6 +1292,12 @@ async def _do_login(creds: Credenciales) -> dict:
             login_url    = SUNAFIL_CASILLA_LOGIN_URL
             redirect_url = SUNAFIL_CASILLA_ORIGINAL_URL
             domains      = ["sunat.gob.pe", "sunafil.gob.pe"]
+        elif creds.portal == "buzon":
+            await page.goto(SUNAT_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
+            await page.wait_for_timeout(600)
+            login_url    = SUNAT_LOGIN_URL
+            redirect_url = SUNAT_MENU_URL
+            domains      = ["sunat.gob.pe", "e-menu.sunat.gob.pe", "api-seguridad.sunat.gob.pe", "ww1.sunat.gob.pe"]
         else:
             await page.goto(SUNAT_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
             await page.wait_for_timeout(600)
@@ -1346,8 +1352,8 @@ async def _do_login(creds: Credenciales) -> dict:
         # del usuario será quien abra luego el URL OAuth de Declaración y Pago
         # (SUNAT_DECLARACION_LOGIN_URL) con esas mismas cookies.
 
-        # ── Warm-up visor: hacer clic en Buzón desde el menú ─────────
-        if creds.portal == "sunat":
+        # ── Warm-up visor: SOLO si portal es "buzon" ─────────
+        if creds.portal == "buzon":
             try:
                 logger.info(f"[{rid}] Warm-up visor via clic en Buzón Electrónico...")
                 await page.goto(SUNAT_MENU_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
@@ -1357,7 +1363,6 @@ async def _do_login(creds: Credenciales) -> dict:
                 all_c = await context.cookies()
                 visor_c = [c for c in all_c if "VISOR" in c["name"]]
                 logger.info(f"[{rid}] Cookies VISOR tras clic: {[c['name'] for c in visor_c]}")
-                logger.info(f"[{rid}] URL tras clic: {page.url}")
             except Exception as e:
                 logger.warning(f"[{rid}] Warm-up visor error: {e}")
         # ─────────────────────────────────────────────────────────────
@@ -1938,6 +1943,13 @@ async def sunafil_proxy_create(creds: Credenciales):
     return await proxy_create(creds)
 
 
+@app.post("/buzon/create")
+async def buzon_create(creds: Credenciales):
+    """Login específico para el buzón — incluye warm-up del visor."""
+    creds.portal = "buzon"
+    return await proxy_create(creds)
+
+
 @app.get("/")
 async def root():
     return {
@@ -1947,6 +1959,7 @@ async def root():
             "POST /proxy/create":              "Login + genera token (portal: sunat|declaracion|sunafil)",
             "POST /declaracion/proxy/create":  "Login Declaración y Pago (alias explícito)",
             "POST /sunafil/proxy/create":      "Login SUNAFIL Casilla (alias explícito)",
+            "POST /buzon/create":              "Login Buzón SOL (alias, incluye warm-up visor)",
             "GET  /proxy/status/{token}":      "Estado del login en background",
             "GET  /proxy/{token}":             "Sirve portal autenticado (página principal)",
             "ANY  /proxy/{token}/r":           "Proxy universal de recursos SUNAT/SUNAFIL",
@@ -1960,6 +1973,7 @@ async def root():
             "sunat":       "Menú SOL (e-menu.sunat.gob.pe)",
             "declaracion": "Declaración y Pago (api-seguridad.sunat.gob.pe)",
             "sunafil":     "Casilla Electrónica SUNAFIL (casillaelectronica.sunafil.gob.pe)",
+            "buzon":      "Buzón SOL (warm-up visor)",
         },
     }
 
