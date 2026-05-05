@@ -1,4 +1,4 @@
-# bot_cookies.py v3.0 - Proxy completo SUNAT
+# bot_cookies.py v3.2 - Proxy completo SUNAT
 # ✅ Login con Playwright (headless)
 # ✅ Proxy completo: HTML + JS + CSS + fuentes + AJAX
 # ✅ Elimina X-Frame-Options (para funcionar en iframe)
@@ -1358,10 +1358,48 @@ async def _do_login(creds: Credenciales) -> dict:
                 logger.info(f"[{rid}] Warm-up visor via clic en Buzón Electrónico...")
                 await page.goto(SUNAT_MENU_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
                 await page.wait_for_timeout(2000)
-                await page.click("#aOpcionBuzon")
-                await page.wait_for_timeout(3000)
+
+                # ── Cerrar TODOS los modales/popups que bloquean el click ──
+                await page.evaluate("""
+                    () => {
+                        // 1. Modal de campaña (ifrVCE / divModalCampana)
+                        var modalCampana = document.getElementById('divModalCampana');
+                        if (modalCampana) modalCampana.style.display = 'none';
+
+                        // 2. Modal "Valida tus datos de contacto"
+                        //    Intentar click en "Finalizar" primero (si está visible)
+                        var btnFinalizar = document.getElementById('btnFinalizarValidacionDatos');
+                        if (btnFinalizar && btnFinalizar.offsetParent !== null) {
+                            btnFinalizar.click();
+                        }
+                        //    Fallback: "Continuar sin confirmar"
+                        var btnCerrar = document.getElementById('btnCerrar');
+                        if (btnCerrar && btnCerrar.offsetParent !== null) {
+                            btnCerrar.click();
+                        }
+
+                        // 3. Limpiar cualquier backdrop/overlay genérico de Bootstrap
+                        document.querySelectorAll('.modal-backdrop').forEach(function(el) { el.remove(); });
+                        document.body.classList.remove('modal-open');
+                        document.body.style.overflow = '';
+                    }
+                """)
+                await page.wait_for_timeout(600)
+                logger.info(f"[{rid}] Modales cerrados via JS")
+
+                # ── Click en Buzón via JS (evita intercepción del pointer) ──
+                clicked = await page.evaluate("""
+                    () => {
+                        var el = document.getElementById('aOpcionBuzon');
+                        if (el) { el.click(); return true; }
+                        return false;
+                    }
+                """)
+                logger.info(f"[{rid}] Click en #aOpcionBuzon via JS: {clicked}")
+                await page.wait_for_timeout(4000)
+
                 all_c = await context.cookies()
-                visor_c = [c for c in all_c if "VISOR" in c["name"]]
+                visor_c = [c for c in all_c if "VISOR" in c["name"].upper()]
                 logger.info(f"[{rid}] Cookies VISOR tras clic: {[c['name'] for c in visor_c]}")
             except Exception as e:
                 logger.warning(f"[{rid}] Warm-up visor error: {e}")
@@ -2011,6 +2049,7 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False, tipo: int 
         }
         # Probar las URLs candidatas del visor hasta encontrar una que funcione
         for warmup_url in [
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",  # URL real actual
             "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/",
             "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/index.jsp",
         ]:
@@ -2024,6 +2063,7 @@ async def buzon_listar(token: str, page: int = 1, todo: bool = False, tipo: int 
                 headers["Cookie"] = cookie_header
                 warmup_headers["Cookie"] = cookie_header
                 if wr.status_code == 200:
+                    logger.info(f"[Buzon] Warm-up OK en {warmup_url}")
                     break
             except Exception as e:
                 logger.warning(f"[Buzon] Warm-up error: {e}")
