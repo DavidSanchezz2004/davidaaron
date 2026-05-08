@@ -208,7 +208,7 @@ def get_client_ip(request: Request) -> str:
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     public = ["/health", "/", "/docs", "/openapi.json"]
-    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/files/")
+    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/buzon/", "/files/")
     if request.url.path.startswith(public_prefixes) or request.url.path in public:
         return await call_next(request)
     if request.headers.get("x-api-key") != API_KEY:
@@ -219,7 +219,7 @@ async def auth_middleware(request: Request, call_next):
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     public = ["/health", "/", "/docs", "/openapi.json"]
-    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/files/")
+    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/buzon/", "/files/")
     if request.url.path.startswith(public_prefixes) or request.url.path in public:
         return await call_next(request)
     ip = get_client_ip(request)
@@ -463,6 +463,158 @@ async def fetch_sunat_detalle(session: dict, codigo_mensaje: str, tipo_msj: str)
         raise RuntimeError("SUNAT_SESSION_EXPIRED")
     resp.raise_for_status()
     return resp.json()
+
+
+async def warmup_sunat_buzon_session(session: dict) -> dict:
+    cookies = {c["name"]: c["value"] for c in session.get("cookies", [])}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    warmup_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+        "Cookie": cookie_header,
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as warmup_client:
+        for warmup_url in [
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/",
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/index.jsp",
+        ]:
+            try:
+                wr = await warmup_client.get(warmup_url, headers=warmup_headers)
+                logger.info(
+                    "[Buzon] Warm-up %s -> %s | cookies nuevas: %s",
+                    warmup_url,
+                    wr.status_code,
+                    list(wr.cookies.keys()),
+                )
+                for name, value in wr.cookies.items():
+                    cookies[name] = value
+                cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                warmup_headers["Cookie"] = cookie_header
+                if wr.status_code == 200:
+                    break
+            except Exception as e:
+                logger.warning("[Buzon] Warm-up error: %s", e)
+    existing = {c.get("name"): c for c in session.get("cookies", [])}
+    for name, value in cookies.items():
+        if name in existing:
+            existing[name]["value"] = value
+        else:
+            session.setdefault("cookies", []).append({
+                "name": name,
+                "value": value,
+                "domain": "ww1.sunat.gob.pe",
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
+                "sameSite": "Lax",
+            })
+    _save_sessions_to_disk()
+    return cookies
+
+
+async def list_sunat_buzon_messages(
+    session: dict,
+    page: int = 1,
+    todo: bool = False,
+    tipo: int = 2,
+    desde: str = "",
+) -> dict:
+    from datetime import datetime as dt
+
+    cookies = await warmup_sunat_buzon_session(session)
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://ww1.sunat.gob.pe",
+        "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+        "Cookie": cookie_header,
+    }
+
+    todos_mensajes = []
+    pagina = max(int(page or 1), 1)
+    data = {}
+    fecha_desde = None
+    if desde:
+        try:
+            fecha_desde = dt.strptime(desde, "%Y-%m-%d")
+        except Exception:
+            logger.warning("[Buzon] Fecha desde inválida: %s", desde)
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
+        while True:
+            params = {
+                "tipoMsj": tipo,
+                "codCarpeta": "00",
+                "codEtiqueta": "",
+                "page": pagina,
+                "des_asunto": "",
+                "codMensaje": "",
+                "tipoOrden": "NADA",
+                "_": str(int(time.time() * 1000)),
+            }
+            r = await client.get(
+                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/listNotiMenPag",
+                params=params,
+                headers=headers,
+            )
+            logger.info("[Buzon] HTTP %s | URL final: %s", r.status_code, r.url)
+            logger.info("[Buzon] Content-Type: %s", r.headers.get("content-type", ""))
+            logger.info("[Buzon] Respuesta: %s", r.text[:500])
+            if r.status_code in (401, 403) or _looks_like_sunat_session_error(r.content, _sniff_mime(r.content, r.headers.get("content-type", ""))):
+                raise RuntimeError("SUNAT_SESSION_EXPIRED")
+            r.raise_for_status()
+            data = r.json()
+            rows = data.get("rows")
+            if rows is None:
+                return {
+                    "ok": False,
+                    "error": "rows_null",
+                    "detalle": "Sesión inválida o RUC sin buzón",
+                    "ruc": session.get("ruc"),
+                    "debug": {
+                        "status": r.status_code,
+                        "url_final": str(r.url),
+                        "content_type": r.headers.get("content-type", ""),
+                        "respuesta": r.text[:500],
+                    },
+                }
+
+            if fecha_desde:
+                rows_validos = []
+                hay_anteriores = False
+                for m in rows:
+                    try:
+                        fec = dt.strptime(m.get("fecEnvio", "01/01/1900"), "%d/%m/%Y")
+                        if fec >= fecha_desde:
+                            rows_validos.append(m)
+                        else:
+                            hay_anteriores = True
+                    except Exception:
+                        rows_validos.append(m)
+                todos_mensajes.extend(rows_validos)
+                if hay_anteriores:
+                    break
+            else:
+                todos_mensajes.extend(rows)
+
+            if not todo or len(rows) < 25:
+                break
+            pagina += 1
+
+    return {
+        "ok": True,
+        "ruc": session.get("ruc"),
+        "total_obtenidos": len(todos_mensajes),
+        "total_buzon": data.get("records", 0),
+        "pagina": pagina,
+        "mensajes": todos_mensajes,
+    }
 
 
 def _attachment_matches(item: dict, cod_archivo: str, nom_archivo: str) -> bool:
@@ -1671,6 +1823,12 @@ async def _do_login(creds: Credenciales) -> dict:
             login_url    = SUNAFIL_CASILLA_LOGIN_URL
             redirect_url = SUNAFIL_CASILLA_ORIGINAL_URL
             domains      = ["sunat.gob.pe", "sunafil.gob.pe"]
+        elif creds.portal == "buzon":
+            await page.goto(SUNAT_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
+            await page.wait_for_timeout(600)
+            login_url    = SUNAT_LOGIN_URL
+            redirect_url = SUNAT_MENU_URL
+            domains      = ["sunat.gob.pe", "e-menu.sunat.gob.pe", "api-seguridad.sunat.gob.pe", "ww1.sunat.gob.pe"]
         else:
             await page.goto(SUNAT_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
             await page.wait_for_timeout(600)
@@ -1724,6 +1882,40 @@ async def _do_login(creds: Credenciales) -> dict:
         # desde el bot; solo necesitamos las cookies del Menú SOL. El navegador
         # del usuario será quien abra luego el URL OAuth de Declaración y Pago
         # (SUNAT_DECLARACION_LOGIN_URL) con esas mismas cookies.
+
+        if creds.portal == "buzon":
+            try:
+                logger.info(f"[{rid}] Warm-up visor via clic en Buzón Electrónico...")
+                await page.goto(SUNAT_MENU_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
+                await page.wait_for_timeout(2000)
+                await page.evaluate("""
+                    () => {
+                        var modalCampana = document.getElementById('divModalCampana');
+                        if (modalCampana) modalCampana.style.display = 'none';
+                        var btnFinalizar = document.getElementById('btnFinalizarValidacionDatos');
+                        if (btnFinalizar && btnFinalizar.offsetParent !== null) btnFinalizar.click();
+                        var btnCerrar = document.getElementById('btnCerrar');
+                        if (btnCerrar && btnCerrar.offsetParent !== null) btnCerrar.click();
+                        document.querySelectorAll('.modal-backdrop').forEach(function(el) { el.remove(); });
+                        document.body.classList.remove('modal-open');
+                        document.body.style.overflow = '';
+                    }
+                """)
+                await page.wait_for_timeout(600)
+                clicked = await page.evaluate("""
+                    () => {
+                        var el = document.getElementById('aOpcionBuzon');
+                        if (el) { el.click(); return true; }
+                        return false;
+                    }
+                """)
+                logger.info(f"[{rid}] Click en #aOpcionBuzon via JS: {clicked}")
+                await page.wait_for_timeout(4000)
+                all_c = await context.cookies()
+                visor_c = [c for c in all_c if "VISOR" in c["name"].upper()]
+                logger.info(f"[{rid}] Cookies VISOR tras clic: {[c['name'] for c in visor_c]}")
+            except Exception as e:
+                logger.warning(f"[{rid}] Warm-up visor error: {e}")
 
         all_cookies = await context.cookies()
         cookies = _filter_cookies(all_cookies, domains)
@@ -2272,6 +2464,72 @@ async def sunat_buzon_detalle(
         return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_DETALLE_ERROR", "message": str(e)})
 
 
+@app.get("/sunat/buzon/{token}/mensajes")
+async def sunat_buzon_mensajes(
+    token: str,
+    page: int = Query(1),
+    todo: bool = Query(False),
+    tipo: int = Query(2),
+    desde: str = Query(""),
+):
+    session, error_response = _get_ready_session(token)
+    if error_response:
+        return error_response
+    try:
+        return await list_sunat_buzon_messages(session, page=page, todo=todo, tipo=tipo, desde=desde)
+    except RuntimeError as e:
+        if str(e) == "SUNAT_SESSION_EXPIRED":
+            return JSONResponse(status_code=410, content={
+                "ok": False,
+                "error": "SUNAT_SESSION_EXPIRED",
+                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
+            })
+        logger.exception("[BuzonMensajes] Error token=%s page=%s tipo=%s", token[:8], page, tipo)
+        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_BUZON_LIST_ERROR", "message": str(e)})
+    except Exception as e:
+        logger.exception("[BuzonMensajes] Error inesperado token=%s page=%s tipo=%s", token[:8], page, tipo)
+        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_BUZON_LIST_ERROR", "message": str(e)})
+
+
+@app.get("/buzon/{token}")
+async def buzon_listar(token: str, page: int = 1, todo: bool = False, tipo: int = 2, desde: str = ""):
+    session, error_response = _get_ready_session(token)
+    if error_response:
+        return error_response
+    try:
+        return await list_sunat_buzon_messages(session, page=page, todo=todo, tipo=tipo, desde=desde)
+    except RuntimeError as e:
+        if str(e) == "SUNAT_SESSION_EXPIRED":
+            return JSONResponse(status_code=410, content={
+                "ok": False,
+                "error": "SUNAT_SESSION_EXPIRED",
+                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
+            })
+        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_BUZON_LIST_ERROR", "message": str(e)})
+    except Exception as e:
+        logger.exception("[BuzonCompat] Error token=%s", token[:8])
+        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_BUZON_LIST_ERROR", "message": str(e)})
+
+
+@app.get("/buzon/{token}/detalle/{codigo_mensaje}")
+async def buzon_detalle_compat(token: str, codigo_mensaje: int, tipoMsj: int = 2):
+    session, error_response = _get_ready_session(token)
+    if error_response:
+        return error_response
+    try:
+        detalle = await fetch_sunat_detalle(session, str(codigo_mensaje), str(tipoMsj))
+        normalized = _normalize_detalle_response(detalle, str(codigo_mensaje), str(tipoMsj), session)
+        return {"ok": True, "ruc": session.get("ruc"), "detalle": {**detalle, "attachments": normalized["attachments"]}}
+    except RuntimeError as e:
+        if str(e) == "SUNAT_SESSION_EXPIRED":
+            return JSONResponse(status_code=410, content={
+                "ok": False,
+                "error": "SUNAT_SESSION_EXPIRED",
+                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
+            })
+        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_DETALLE_ERROR", "message": str(e)})
+
+
 @app.get("/sunat/buzon/{token}/documento-html")
 async def sunat_buzon_documento_html(
     token: str,
@@ -2483,6 +2741,13 @@ async def sunafil_proxy_create(creds: Credenciales):
     return await proxy_create(creds)
 
 
+@app.post("/buzon/create")
+async def buzon_create(creds: Credenciales):
+    """Login específico para Buzón SOL. Incluye warm-up del visor."""
+    creds.portal = "buzon"
+    return await proxy_create(creds)
+
+
 @app.get("/")
 async def root():
     return {
@@ -2492,12 +2757,15 @@ async def root():
             "POST /proxy/create":              "Login + genera token (portal: sunat|declaracion|sunafil)",
             "POST /declaracion/proxy/create":  "Login Declaración y Pago (alias explícito)",
             "POST /sunafil/proxy/create":      "Login SUNAFIL Casilla (alias explícito)",
+            "POST /buzon/create":              "Login Buzón SOL (alias, incluye warm-up visor)",
             "GET  /proxy/status/{token}":      "Estado del login en background",
             "GET  /proxy/{token}":             "Sirve portal autenticado (página principal)",
             "ANY  /proxy/{token}/r":           "Proxy universal de recursos SUNAT/SUNAFIL",
             "GET  /ext-inject/{token}":        "Página para extensión Chrome (inyección de cookies)",
             "GET  /get-cookies/{token}":       "Devuelve cookies raw para extensión",
             "GET  /session-redirect/{token}":  "Redirige con cookies inyectadas (pestaña real)",
+            "GET  /buzon/{token}":             "Lista mensajes del Buzón SOL (compatibilidad Laravel)",
+            "GET  /sunat/buzon/{token}/mensajes": "Lista mensajes del Buzón SOL",
             "GET  /sunat/buzon/{token}/detalle": "Detalle Buzón SOL con adjuntos normalizados",
             "GET  /sunat/buzon/{token}/documento-html": "Genera vista HTML interna de documento SUNAT",
             "GET  /sunat/buzon/{token}/adjunto": "Descarga adjunto SUNAT y retorna URL interna",
@@ -2509,6 +2777,7 @@ async def root():
             "sunat":       "Menú SOL (e-menu.sunat.gob.pe)",
             "declaracion": "Declaración y Pago (api-seguridad.sunat.gob.pe)",
             "sunafil":     "Casilla Electrónica SUNAFIL (casillaelectronica.sunafil.gob.pe)",
+            "buzon":       "Buzón SOL (warm-up visor)",
         },
     }
 
