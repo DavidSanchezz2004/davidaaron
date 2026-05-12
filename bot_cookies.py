@@ -1,19 +1,18 @@
-# bot_cookies.py v3.0 - Proxy completo SUNAT
+# bot_cookies.py v3.2 - Proxy completo SUNAT
 # ✅ Login con Playwright (headless)
 # ✅ Proxy completo: HTML + JS + CSS + fuentes + AJAX
 # ✅ Elimina X-Frame-Options (para funcionar en iframe)
 # ✅ Reescribe todas las URLs para pasar por el proxy
 # ✅ Intercepta AJAX de SUNAT y los redirige correctamente
 
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response, FileResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 from playwright.async_api import async_playwright
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urljoin, quote, unquote
-from pathlib import Path
 import logging
 import os
 import uuid
@@ -22,9 +21,6 @@ import json
 import httpx
 import asyncio
 import random
-import mimetypes
-import time
-import html
 
 # ===============================
 # CONFIGURACIÓN
@@ -51,11 +47,8 @@ PROXY_BASE = os.environ.get("COOKIES_PROXY_BASE", "http://localhost:8001")
 
 # Archivo para persistir sesiones entre reinicios
 SESSIONS_FILE = os.environ.get("COOKIES_SESSIONS_FILE", "proxy_sessions.json")
-SUNAT_BUZON_TMP_DIR = Path(os.environ.get("SUNAT_BUZON_TMP_DIR", "storage/tmp/sunat_buzon"))
-SUNAT_BUZON_FILE_TTL_SECONDS = int(os.environ.get("SUNAT_BUZON_FILE_TTL_SECONDS", "7200"))
 
 request_times: dict[str, list[datetime]] = {}
-file_tokens: dict[str, dict] = {}
 
 # ===============================
 # PLAYWRIGHT GLOBAL (REUSO)
@@ -208,7 +201,7 @@ def get_client_ip(request: Request) -> str:
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     public = ["/health", "/", "/docs", "/openapi.json"]
-    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/buzon/", "/files/")
+    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/buzon/")
     if request.url.path.startswith(public_prefixes) or request.url.path in public:
         return await call_next(request)
     if request.headers.get("x-api-key") != API_KEY:
@@ -219,7 +212,7 @@ async def auth_middleware(request: Request, call_next):
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     public = ["/health", "/", "/docs", "/openapi.json"]
-    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/buzon/", "/files/")
+    public_prefixes = ("/proxy/", "/get-cookies/", "/ext-inject/", "/session-redirect/", "/buzon/")
     if request.url.path.startswith(public_prefixes) or request.url.path in public:
         return await call_next(request)
     ip = get_client_ip(request)
@@ -252,24 +245,6 @@ def _cookies_to_header(cookies: list) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
 
-def _get_ready_session(token: str) -> tuple[dict | None, JSONResponse | None]:
-    _cleanup_proxy_sessions()
-    session = proxy_sessions.get(token)
-    if not session or session["expires_at"] <= datetime.now():
-        if session:
-            del proxy_sessions[token]
-        return None, JSONResponse(status_code=410, content={
-            "ok": False,
-            "error": "SUNAT_SESSION_EXPIRED",
-            "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
-        })
-    if session.get("status") == "pending":
-        return None, JSONResponse(status_code=202, content={"ok": False, "error": "login_pending"})
-    if session.get("status") == "error":
-        return None, JSONResponse(status_code=422, content={"ok": False, "error": session.get("error", "login_error")})
-    return session, None
-
-
 def _filter_cookies(cookies: list, domains: list) -> list:
     result = []
     for c in cookies:
@@ -287,367 +262,6 @@ def _filter_cookies(cookies: list, domains: list) -> list:
     return result
 
 
-def sanitize_filename(name: str, fallback: str = "documento") -> str:
-    name = unquote(str(name or "")).strip()
-    name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", name)
-    name = re.sub(r"\s+", " ", name).strip(" .")
-    name = re.sub(r"_+", "_", name)
-    return name[:180] or fallback
-
-
-def _safe_path_part(value: str, fallback: str = "unknown") -> str:
-    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "")).strip("._")
-    return value[:80] or fallback
-
-
-def _decode_sunat_text(value: str) -> str:
-    if not value:
-        return ""
-    return html.unescape(unquote(str(value))).strip()
-
-
-def _parse_msj_mensaje(detalle: dict) -> dict:
-    raw = detalle.get("msjMensaje")
-    if isinstance(raw, dict):
-        return raw
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def normalize_attachments(detalle: dict) -> list[dict]:
-    attachments = []
-    for item in detalle.get("listAttach", []) or []:
-        if item.get("indMensaje") == "2" and item.get("codArchivo"):
-            attachments.append({
-                "kind": "attachment",
-                "codArchivo": item.get("codArchivo"),
-                "nomArchivo": item.get("nomArchivo"),
-                "size": item.get("cntTamarch"),
-                "sizeFormat": item.get("tamanoArchivoFormat"),
-                "canDownload": True,
-            })
-        elif item.get("indMensaje") == "3" and item.get("numId"):
-            attachments.append({
-                "kind": "generated_html",
-                "numId": item.get("numId"),
-                "canPreview": True,
-            })
-    return attachments
-
-
-def _normalize_detalle_response(detalle: dict, codigo_mensaje: str, tipo_msj: str, session: dict) -> dict:
-    msg = _parse_msj_mensaje(detalle)
-    attachments = normalize_attachments(detalle)
-    return {
-        "ok": True,
-        "codigoMensaje": codigo_mensaje,
-        "tipoMsj": tipo_msj,
-        "ruc": detalle.get("codUsuario") or msg.get("numruc") or session.get("ruc"),
-        "asunto": _decode_sunat_text(msg.get("numero") or detalle.get("asunto") or detalle.get("titulo") or ""),
-        "nombUsuario": detalle.get("nombUsuario") or _decode_sunat_text(msg.get("nombre") or ""),
-        "raw": detalle,
-        "attachments": attachments,
-        "htmlPreviewAvailable": any(a.get("kind") == "generated_html" for a in attachments) or bool(detalle.get("url")),
-    }
-
-
-def _register_temp_file(path: Path, mime: str, filename: str, source: str = "sunat") -> str:
-    token = uuid.uuid4().hex
-    file_tokens[token] = {
-        "path": str(path.resolve()),
-        "mime": mime or mimetypes.guess_type(str(path))[0] or "application/octet-stream",
-        "filename": filename,
-        "source": source,
-        "created_at": time.time(),
-        "expires_at": time.time() + SUNAT_BUZON_FILE_TTL_SECONDS,
-    }
-    return token
-
-
-def _cleanup_file_tokens():
-    now = time.time()
-    expired = [token for token, info in file_tokens.items() if info.get("expires_at", 0) <= now]
-    for token in expired:
-        file_tokens.pop(token, None)
-
-
-def _sniff_mime(content: bytes, header_content_type: str = "") -> str:
-    content_type = (header_content_type or "").split(";")[0].strip().lower()
-    prefix = content[:512].lstrip().lower()
-    if content.startswith(b"%PDF"):
-        return "application/pdf"
-    if prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html") or b"<html" in prefix[:200]:
-        return "text/html"
-    if content_type:
-        return content_type
-    return "application/octet-stream"
-
-
-def _looks_like_sunat_session_error(content: bytes, mime: str) -> bool:
-    if mime != "text/html":
-        return False
-    text = content[:5000].decode("utf-8", errors="ignore").lower()
-    signals = [
-        "login",
-        "oauth2",
-        "sesión ha expirado",
-        "sesion ha expirado",
-        "saliendo del men",
-        "autentic",
-        "clave sol",
-    ]
-    return any(signal in text for signal in signals)
-
-
-def _ensure_extension(filename: str, mime: str) -> str:
-    root, ext = os.path.splitext(filename)
-    if ext:
-        return filename
-    if mime == "application/pdf":
-        return filename + ".pdf"
-    if mime == "text/html":
-        return filename + ".html"
-    guessed = mimetypes.guess_extension(mime or "")
-    return filename + (guessed or ".bin")
-
-
-async def _sunat_request_with_cookies(
-    session: dict,
-    url: str,
-    method: str = "GET",
-    headers: dict | None = None,
-    content: bytes | None = None,
-    timeout: float = 30.0,
-) -> httpx.Response:
-    cookie_header = _cookies_to_header(session.get("cookies", []))
-    u = urlparse(url)
-    origin = f"{u.scheme}://{u.netloc}"
-    req_headers = {
-        "Cookie": cookie_header,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "es-PE,es;q=0.9",
-        "Referer": origin + "/",
-    }
-    if headers:
-        req_headers.update(headers)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, verify=False) as client:
-        return await client.request(method, url, headers=req_headers, content=content)
-
-
-async def fetch_sunat_detalle(session: dict, codigo_mensaje: str, tipo_msj: str) -> dict:
-    ts = int(time.time() * 1000)
-    url = (
-        "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerDetalleNotiMen"
-        f"?codigoMensaje={quote(str(codigo_mensaje))}&tipoMsj={quote(str(tipo_msj))}&_={ts}"
-    )
-    resp = await _sunat_request_with_cookies(
-        session,
-        url,
-        headers={"Accept": "application/json, text/javascript, */*; q=0.01", "X-Requested-With": "XMLHttpRequest"},
-    )
-    logger.info(
-        "[BuzonDetalle] codigoMensaje=%s tipoMsj=%s status=%s content-type=%s size=%s",
-        codigo_mensaje,
-        tipo_msj,
-        resp.status_code,
-        resp.headers.get("content-type", ""),
-        len(resp.content),
-    )
-    if resp.status_code in (401, 403) or _looks_like_sunat_session_error(resp.content, _sniff_mime(resp.content, resp.headers.get("content-type", ""))):
-        raise RuntimeError("SUNAT_SESSION_EXPIRED")
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def warmup_sunat_buzon_session(session: dict) -> dict:
-    cookies = {c["name"]: c["value"] for c in session.get("cookies", [])}
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    warmup_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9",
-        "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
-        "Cookie": cookie_header,
-    }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as warmup_client:
-        for warmup_url in [
-            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
-            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/",
-            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/index.jsp",
-        ]:
-            try:
-                wr = await warmup_client.get(warmup_url, headers=warmup_headers)
-                logger.info(
-                    "[Buzon] Warm-up %s -> %s | cookies nuevas: %s",
-                    warmup_url,
-                    wr.status_code,
-                    list(wr.cookies.keys()),
-                )
-                for name, value in wr.cookies.items():
-                    cookies[name] = value
-                cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-                warmup_headers["Cookie"] = cookie_header
-                if wr.status_code == 200:
-                    break
-            except Exception as e:
-                logger.warning("[Buzon] Warm-up error: %s", e)
-    existing = {c.get("name"): c for c in session.get("cookies", [])}
-    for name, value in cookies.items():
-        if name in existing:
-            existing[name]["value"] = value
-        else:
-            session.setdefault("cookies", []).append({
-                "name": name,
-                "value": value,
-                "domain": "ww1.sunat.gob.pe",
-                "path": "/",
-                "secure": True,
-                "httpOnly": False,
-                "sameSite": "Lax",
-            })
-    _save_sessions_to_disk()
-    return cookies
-
-
-async def list_sunat_buzon_messages(
-    session: dict,
-    page: int = 1,
-    todo: bool = False,
-    tipo: int = 2,
-    desde: str = "",
-) -> dict:
-    from datetime import datetime as dt
-
-    cookies = await warmup_sunat_buzon_session(session)
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "es-ES,es;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://ww1.sunat.gob.pe",
-        "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
-        "Cookie": cookie_header,
-    }
-
-    todos_mensajes = []
-    pagina = max(int(page or 1), 1)
-    data = {}
-    fecha_desde = None
-    if desde:
-        try:
-            fecha_desde = dt.strptime(desde, "%Y-%m-%d")
-        except Exception:
-            logger.warning("[Buzon] Fecha desde inválida: %s", desde)
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
-        while True:
-            params = {
-                "tipoMsj": tipo,
-                "codCarpeta": "00",
-                "codEtiqueta": "",
-                "page": pagina,
-                "des_asunto": "",
-                "codMensaje": "",
-                "tipoOrden": "NADA",
-                "_": str(int(time.time() * 1000)),
-            }
-            r = await client.get(
-                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/listNotiMenPag",
-                params=params,
-                headers=headers,
-            )
-            logger.info("[Buzon] HTTP %s | URL final: %s", r.status_code, r.url)
-            logger.info("[Buzon] Content-Type: %s", r.headers.get("content-type", ""))
-            logger.info("[Buzon] Respuesta: %s", r.text[:500])
-            if r.status_code in (401, 403) or _looks_like_sunat_session_error(r.content, _sniff_mime(r.content, r.headers.get("content-type", ""))):
-                raise RuntimeError("SUNAT_SESSION_EXPIRED")
-            r.raise_for_status()
-            data = r.json()
-            rows = data.get("rows")
-            if rows is None:
-                return {
-                    "ok": False,
-                    "error": "rows_null",
-                    "detalle": "Sesión inválida o RUC sin buzón",
-                    "ruc": session.get("ruc"),
-                    "debug": {
-                        "status": r.status_code,
-                        "url_final": str(r.url),
-                        "content_type": r.headers.get("content-type", ""),
-                        "respuesta": r.text[:500],
-                    },
-                }
-
-            if fecha_desde:
-                rows_validos = []
-                hay_anteriores = False
-                for m in rows:
-                    try:
-                        fec = dt.strptime(m.get("fecEnvio", "01/01/1900"), "%d/%m/%Y")
-                        if fec >= fecha_desde:
-                            rows_validos.append(m)
-                        else:
-                            hay_anteriores = True
-                    except Exception:
-                        rows_validos.append(m)
-                todos_mensajes.extend(rows_validos)
-                if hay_anteriores:
-                    break
-            else:
-                todos_mensajes.extend(rows)
-
-            if not todo or len(rows) < 25:
-                break
-            pagina += 1
-
-    return {
-        "ok": True,
-        "ruc": session.get("ruc"),
-        "total_obtenidos": len(todos_mensajes),
-        "total_buzon": data.get("records", 0),
-        "pagina": pagina,
-        "mensajes": todos_mensajes,
-    }
-
-
-def _attachment_matches(item: dict, cod_archivo: str, nom_archivo: str) -> bool:
-    return (
-        item.get("indMensaje") == "2"
-        and str(item.get("codArchivo")) == str(cod_archivo)
-        and str(item.get("nomArchivo") or "") == str(nom_archivo or "")
-    )
-
-
-def _attachment_download_candidates(cod_archivo: str, nom_archivo: str, detalle: dict) -> list[str]:
-    encoded_cod = quote(str(cod_archivo))
-    encoded_name = quote(str(nom_archivo or ""))
-    candidates = [
-        f"https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/descargarArchivo?codArchivo={encoded_cod}",
-        f"https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/descargaArchivo?codArchivo={encoded_cod}",
-        f"https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerArchivo?codArchivo={encoded_cod}",
-        f"https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/descargarAdjunto?codArchivo={encoded_cod}",
-        f"https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/descargarArchivo?codArchivo={encoded_cod}&nomArchivo={encoded_name}",
-    ]
-    raw = json.dumps(detalle, ensure_ascii=False)
-    for match in re.findall(r'https?://[^"\']+', raw):
-        if str(cod_archivo) in match:
-            candidates.insert(0, match)
-    seen = set()
-    unique = []
-    for url in candidates:
-        if url not in seen:
-            seen.add(url)
-            unique.append(url)
-    return unique
-
-
 # Extensiones de activos estáticos que no necesitan pasar por el proxy
 # ⚠️ Fuentes (.woff, .woff2, .ttf, .eot, .otf) NO están aquí — deben pasar
 #    por el proxy para recibir Access-Control-Allow-Origin: * (CORS)
@@ -663,7 +277,7 @@ def _make_proxy_url(token: str, target_url: str) -> str:
     return f"{PROXY_BASE}/proxy/{token}/r?url={encoded}"
 
 
-def _rewrite_html(html: str, token: str, base_url: str, proxy_static: bool = False) -> str:
+def _rewrite_html(html: str, token: str, base_url: str) -> str:
     """
     Reescribe el HTML para que todos los recursos pasen por el proxy.
     Maneja: src=, href=, action=, url(), @import, fetch(), XMLHttpRequest
@@ -688,7 +302,7 @@ def _rewrite_html(html: str, token: str, base_url: str, proxy_static: bool = Fal
             ext = os.path.splitext(urlparse(abs_url).path)[1].lower()
         except Exception:
             ext = ""
-        if ext in STATIC_EXTENSIONS and not proxy_static:
+        if ext in STATIC_EXTENSIONS:
             return abs_url
         # Solo proxear dominios de SUNAT
         if any(d in abs_url for d in ["sunat.gob.pe", "sunafil.gob.pe"]):
@@ -1650,151 +1264,6 @@ async def _login_ok(page) -> bool:
             continue
     return False
 
-
-async def _new_authenticated_context(session: dict):
-    global browser
-    if not browser:
-        raise RuntimeError("Playwright/Chromium no inicializado (startup no ejecutado)")
-    context, page = await _nuevo_context(browser)
-    cookies = session.get("cookies") or []
-    if cookies:
-        await context.add_cookies(cookies)
-    return context, page
-
-
-async def fetch_generated_document_html(token: str, session: dict, detalle: dict) -> tuple[bytes, str, str]:
-    relative_url = detalle.get("url")
-    if not relative_url:
-        raise ValueError("El detalle SUNAT no contiene URL de documento HTML")
-    target_url = urljoin("https://ww1.sunat.gob.pe", relative_url)
-    context = page = None
-    try:
-        context, page = await _new_authenticated_context(session)
-        resp = await page.goto(target_url, wait_until="networkidle", timeout=PW_NAV_TIMEOUT)
-        status = resp.status if resp else 0
-        content_type = resp.headers.get("content-type", "") if resp else ""
-        html_content = await page.content()
-        content = _rewrite_html(html_content, token, target_url, proxy_static=True).encode("utf-8", errors="replace")
-        mime = _sniff_mime(content, content_type or "text/html")
-        logger.info(
-            "[BuzonHtml] url=%s status=%s content-type=%s first-bytes=%s size=%s",
-            target_url,
-            status,
-            content_type,
-            content[:16].hex(),
-            len(content),
-        )
-        if status in (401, 403) or _looks_like_sunat_session_error(content, mime):
-            raise RuntimeError("SUNAT_SESSION_EXPIRED")
-        if status >= 400:
-            raise RuntimeError(f"SUNAT_HTTP_{status}")
-        return content, "text/html", target_url
-    finally:
-        for obj, method in [(page, "close"), (context, "close")]:
-            try:
-                if obj:
-                    await getattr(obj, method)()
-            except Exception:
-                pass
-
-
-async def discover_attachment_download_url(
-    token: str,
-    session: dict,
-    detalle: dict,
-    cod_archivo: str,
-    nom_archivo: str,
-) -> str | None:
-    """Best-effort discovery hook.
-
-    SUNAT has changed this route over time. We first try known URL patterns.
-    If they fail, this function is the single place to add DOM-driven discovery
-    for the current visor screen without changing the public endpoint contract.
-    """
-    cached = session.get("buzon_attachment_patterns") or {}
-    if cached.get("url_template"):
-        return cached["url_template"].format(codArchivo=quote(str(cod_archivo)), nomArchivo=quote(str(nom_archivo or "")))
-
-    # The JSON detail sometimes embeds the final URL in future variants.
-    raw = json.dumps(detalle, ensure_ascii=False)
-    for match in re.findall(r'https?://[^"\']+', raw):
-        if str(cod_archivo) in match and "sunat.gob.pe" in urlparse(match).netloc:
-            return match
-
-    logger.info(
-        "[BuzonAdjuntoDiscovery] No DOM URL available yet token=%s codigoDetalle=%s codArchivo=%s nomArchivo=%s",
-        token[:8],
-        _parse_msj_mensaje(detalle).get("cod_mensaje"),
-        cod_archivo,
-        nom_archivo,
-    )
-    return None
-
-
-async def download_attachment_binary(
-    token: str,
-    session: dict,
-    detalle: dict,
-    codigo_mensaje: str,
-    tipo_msj: str,
-    cod_archivo: str,
-    nom_archivo: str,
-) -> tuple[bytes, str, str]:
-    candidates = _attachment_download_candidates(cod_archivo, nom_archivo, detalle)
-    discovered = await discover_attachment_download_url(token, session, detalle, cod_archivo, nom_archivo)
-    if discovered:
-        candidates.insert(0, discovered)
-
-    last_error = None
-    for url in dict.fromkeys(candidates):
-        try:
-            resp = await _sunat_request_with_cookies(
-                session,
-                url,
-                headers={
-                    "Accept": "application/pdf,application/octet-stream,text/html,*/*",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
-                timeout=45.0,
-            )
-            content = resp.content or b""
-            mime = _sniff_mime(content, resp.headers.get("content-type", ""))
-            logger.info(
-                "[BuzonAdjunto] codigoMensaje=%s tipoMsj=%s codArchivo=%s nomArchivo=%s url=%s status=%s content-type=%s first-bytes=%s size=%s",
-                codigo_mensaje,
-                tipo_msj,
-                cod_archivo,
-                nom_archivo,
-                url,
-                resp.status_code,
-                resp.headers.get("content-type", ""),
-                content[:16].hex(),
-                len(content),
-            )
-            if resp.status_code in (401, 403) or _looks_like_sunat_session_error(content, mime):
-                raise RuntimeError("SUNAT_SESSION_EXPIRED")
-            if resp.status_code >= 400 or not content:
-                last_error = f"HTTP {resp.status_code}"
-                continue
-            if mime not in ("application/pdf", "application/octet-stream", "text/html"):
-                last_error = f"UNSUPPORTED_CONTENT_TYPE {mime}"
-                continue
-            if mime == "text/html" and not content.startswith(b"%PDF"):
-                # A real attachment should not be an HTML page. Keep this as a clear
-                # error instead of storing a login/error page as if it were a PDF.
-                last_error = "SUNAT_RETURNED_HTML"
-                continue
-            if mime == "application/octet-stream" and content.startswith(b"%PDF"):
-                mime = "application/pdf"
-            return content, mime, str(resp.url)
-        except RuntimeError:
-            raise
-        except Exception as e:
-            last_error = str(e)
-            logger.warning("[BuzonAdjunto] candidate failed url=%s error=%s", url, e)
-
-    raise RuntimeError(f"SUNAT_ATTACHMENT_ENDPOINT_NOT_FOUND: {last_error or 'sin respuesta válida'}")
-
 # ===============================
 # LOGIN CORE
 # ===============================
@@ -1834,7 +1303,7 @@ async def _do_login(creds: Credenciales) -> dict:
             await page.wait_for_timeout(600)
             login_url    = SUNAT_LOGIN_URL
             redirect_url = SUNAT_MENU_URL
-            domains      = ["sunat.gob.pe", "e-menu.sunat.gob.pe", "api-seguridad.sunat.gob.pe"]
+            domains      = ["sunat.gob.pe", "e-menu.sunat.gob.pe", "api-seguridad.sunat.gob.pe", "ww1.sunat.gob.pe"]
 
         resp = await page.goto(login_url, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
         if not resp or resp.status != 200:
@@ -1883,25 +1352,42 @@ async def _do_login(creds: Credenciales) -> dict:
         # del usuario será quien abra luego el URL OAuth de Declaración y Pago
         # (SUNAT_DECLARACION_LOGIN_URL) con esas mismas cookies.
 
+        # ── Warm-up visor: SOLO si portal es "buzon" ─────────
         if creds.portal == "buzon":
             try:
                 logger.info(f"[{rid}] Warm-up visor via clic en Buzón Electrónico...")
                 await page.goto(SUNAT_MENU_URL, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT)
                 await page.wait_for_timeout(2000)
+
+                # ── Cerrar TODOS los modales/popups que bloquean el click ──
                 await page.evaluate("""
                     () => {
+                        // 1. Modal de campaña (ifrVCE / divModalCampana)
                         var modalCampana = document.getElementById('divModalCampana');
                         if (modalCampana) modalCampana.style.display = 'none';
+
+                        // 2. Modal "Valida tus datos de contacto"
+                        //    Intentar click en "Finalizar" primero (si está visible)
                         var btnFinalizar = document.getElementById('btnFinalizarValidacionDatos');
-                        if (btnFinalizar && btnFinalizar.offsetParent !== null) btnFinalizar.click();
+                        if (btnFinalizar && btnFinalizar.offsetParent !== null) {
+                            btnFinalizar.click();
+                        }
+                        //    Fallback: "Continuar sin confirmar"
                         var btnCerrar = document.getElementById('btnCerrar');
-                        if (btnCerrar && btnCerrar.offsetParent !== null) btnCerrar.click();
+                        if (btnCerrar && btnCerrar.offsetParent !== null) {
+                            btnCerrar.click();
+                        }
+
+                        // 3. Limpiar cualquier backdrop/overlay genérico de Bootstrap
                         document.querySelectorAll('.modal-backdrop').forEach(function(el) { el.remove(); });
                         document.body.classList.remove('modal-open');
                         document.body.style.overflow = '';
                     }
                 """)
                 await page.wait_for_timeout(600)
+                logger.info(f"[{rid}] Modales cerrados via JS")
+
+                # ── Click en Buzón via JS (evita intercepción del pointer) ──
                 clicked = await page.evaluate("""
                     () => {
                         var el = document.getElementById('aOpcionBuzon');
@@ -1911,11 +1397,13 @@ async def _do_login(creds: Credenciales) -> dict:
                 """)
                 logger.info(f"[{rid}] Click en #aOpcionBuzon via JS: {clicked}")
                 await page.wait_for_timeout(4000)
+
                 all_c = await context.cookies()
                 visor_c = [c for c in all_c if "VISOR" in c["name"].upper()]
                 logger.info(f"[{rid}] Cookies VISOR tras clic: {[c['name'] for c in visor_c]}")
             except Exception as e:
                 logger.warning(f"[{rid}] Warm-up visor error: {e}")
+        # ─────────────────────────────────────────────────────────────
 
         all_cookies = await context.cookies()
         cookies = _filter_cookies(all_cookies, domains)
@@ -2438,254 +1926,6 @@ async def _proxy_fetch(
         return Response(content=f"Proxy error: {e}".encode(), status_code=502)
 
 
-@app.get("/sunat/buzon/{token}/detalle")
-async def sunat_buzon_detalle(
-    token: str,
-    codigoMensaje: str = Query(...),
-    tipoMsj: str = Query(...),
-):
-    session, error_response = _get_ready_session(token)
-    if error_response:
-        return error_response
-    try:
-        detalle = await fetch_sunat_detalle(session, codigoMensaje, tipoMsj)
-        return _normalize_detalle_response(detalle, codigoMensaje, tipoMsj, session)
-    except RuntimeError as e:
-        if str(e) == "SUNAT_SESSION_EXPIRED":
-            return JSONResponse(status_code=410, content={
-                "ok": False,
-                "error": "SUNAT_SESSION_EXPIRED",
-                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
-            })
-        logger.exception("[BuzonDetalle] Error codigoMensaje=%s tipoMsj=%s", codigoMensaje, tipoMsj)
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_DETALLE_ERROR", "message": str(e)})
-    except Exception as e:
-        logger.exception("[BuzonDetalle] Error inesperado codigoMensaje=%s tipoMsj=%s", codigoMensaje, tipoMsj)
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_DETALLE_ERROR", "message": str(e)})
-
-
-@app.get("/sunat/buzon/{token}/mensajes")
-async def sunat_buzon_mensajes(
-    token: str,
-    page: int = Query(1),
-    todo: bool = Query(False),
-    tipo: int = Query(2),
-    desde: str = Query(""),
-):
-    session, error_response = _get_ready_session(token)
-    if error_response:
-        return error_response
-    try:
-        return await list_sunat_buzon_messages(session, page=page, todo=todo, tipo=tipo, desde=desde)
-    except RuntimeError as e:
-        if str(e) == "SUNAT_SESSION_EXPIRED":
-            return JSONResponse(status_code=410, content={
-                "ok": False,
-                "error": "SUNAT_SESSION_EXPIRED",
-                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
-            })
-        logger.exception("[BuzonMensajes] Error token=%s page=%s tipo=%s", token[:8], page, tipo)
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_BUZON_LIST_ERROR", "message": str(e)})
-    except Exception as e:
-        logger.exception("[BuzonMensajes] Error inesperado token=%s page=%s tipo=%s", token[:8], page, tipo)
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_BUZON_LIST_ERROR", "message": str(e)})
-
-
-@app.get("/buzon/{token}")
-async def buzon_listar(token: str, page: int = 1, todo: bool = False, tipo: int = 2, desde: str = ""):
-    session, error_response = _get_ready_session(token)
-    if error_response:
-        return error_response
-    try:
-        return await list_sunat_buzon_messages(session, page=page, todo=todo, tipo=tipo, desde=desde)
-    except RuntimeError as e:
-        if str(e) == "SUNAT_SESSION_EXPIRED":
-            return JSONResponse(status_code=410, content={
-                "ok": False,
-                "error": "SUNAT_SESSION_EXPIRED",
-                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
-            })
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_BUZON_LIST_ERROR", "message": str(e)})
-    except Exception as e:
-        logger.exception("[BuzonCompat] Error token=%s", token[:8])
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_BUZON_LIST_ERROR", "message": str(e)})
-
-
-@app.get("/buzon/{token}/detalle/{codigo_mensaje}")
-async def buzon_detalle_compat(token: str, codigo_mensaje: int, tipoMsj: int = 2):
-    session, error_response = _get_ready_session(token)
-    if error_response:
-        return error_response
-    try:
-        detalle = await fetch_sunat_detalle(session, str(codigo_mensaje), str(tipoMsj))
-        normalized = _normalize_detalle_response(detalle, str(codigo_mensaje), str(tipoMsj), session)
-        return {"ok": True, "ruc": session.get("ruc"), "detalle": {**detalle, "attachments": normalized["attachments"]}}
-    except RuntimeError as e:
-        if str(e) == "SUNAT_SESSION_EXPIRED":
-            return JSONResponse(status_code=410, content={
-                "ok": False,
-                "error": "SUNAT_SESSION_EXPIRED",
-                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
-            })
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_DETALLE_ERROR", "message": str(e)})
-
-
-@app.get("/sunat/buzon/{token}/documento-html")
-async def sunat_buzon_documento_html(
-    token: str,
-    codigoMensaje: str = Query(...),
-    tipoMsj: str = Query(...),
-):
-    session, error_response = _get_ready_session(token)
-    if error_response:
-        return error_response
-    try:
-        detalle = await fetch_sunat_detalle(session, codigoMensaje, tipoMsj)
-        content, mime, _source_url = await fetch_generated_document_html(token, session, detalle)
-        msg = _parse_msj_mensaje(detalle)
-        ruc = _safe_path_part(detalle.get("codUsuario") or msg.get("numruc") or session.get("ruc"))
-        codigo = _safe_path_part(codigoMensaje)
-        base_dir = SUNAT_BUZON_TMP_DIR / ruc / codigo
-        base_dir.mkdir(parents=True, exist_ok=True)
-        filename = sanitize_filename(f"documento_{codigoMensaje}", "documento") + ".html"
-        path = base_dir / filename
-        path.write_bytes(content)
-        file_token = _register_temp_file(path, mime, filename, "gendocS01Alias")
-        return {
-            "ok": True,
-            "type": "html",
-            "url": f"/files/{file_token}",
-            "source": "gendocS01Alias",
-        }
-    except RuntimeError as e:
-        if str(e) == "SUNAT_SESSION_EXPIRED":
-            return JSONResponse(status_code=410, content={
-                "ok": False,
-                "error": "SUNAT_SESSION_EXPIRED",
-                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
-            })
-        logger.exception("[BuzonHtml] Error codigoMensaje=%s tipoMsj=%s", codigoMensaje, tipoMsj)
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_HTML_ERROR", "message": str(e)})
-    except Exception as e:
-        logger.exception("[BuzonHtml] Error inesperado codigoMensaje=%s tipoMsj=%s", codigoMensaje, tipoMsj)
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_HTML_ERROR", "message": str(e)})
-
-
-@app.get("/sunat/buzon/{token}/adjunto")
-async def sunat_buzon_adjunto(
-    token: str,
-    codigoMensaje: str = Query(...),
-    tipoMsj: str = Query(...),
-    codArchivo: str = Query(...),
-    nomArchivo: str = Query(...),
-):
-    session, error_response = _get_ready_session(token)
-    if error_response:
-        return error_response
-    try:
-        detalle = await fetch_sunat_detalle(session, codigoMensaje, tipoMsj)
-        list_attach = detalle.get("listAttach", []) or []
-        attach = next((item for item in list_attach if _attachment_matches(item, codArchivo, nomArchivo)), None)
-        if not attach:
-            return JSONResponse(status_code=404, content={
-                "ok": False,
-                "error": "ATTACHMENT_NOT_FOUND",
-                "message": "El adjunto solicitado no pertenece al mensaje SUNAT.",
-            })
-
-        content, mime, _final_url = await download_attachment_binary(
-            token,
-            session,
-            detalle,
-            codigoMensaje,
-            tipoMsj,
-            codArchivo,
-            nomArchivo,
-        )
-        expected_size = attach.get("cntTamarch")
-        if expected_size and int(expected_size) != len(content):
-            logger.warning(
-                "[BuzonAdjunto] Size mismatch codigoMensaje=%s codArchivo=%s expected=%s received=%s",
-                codigoMensaje,
-                codArchivo,
-                expected_size,
-                len(content),
-            )
-        if len(content) <= 0:
-            return JSONResponse(status_code=502, content={"ok": False, "error": "EMPTY_ATTACHMENT"})
-
-        msg = _parse_msj_mensaje(detalle)
-        ruc = _safe_path_part(detalle.get("codUsuario") or msg.get("numruc") or session.get("ruc"))
-        codigo = _safe_path_part(codigoMensaje)
-        base_dir = SUNAT_BUZON_TMP_DIR / ruc / codigo
-        base_dir.mkdir(parents=True, exist_ok=True)
-        filename = _ensure_extension(sanitize_filename(nomArchivo, f"adjunto_{codArchivo}"), mime)
-        path = base_dir / filename
-        path.write_bytes(content)
-        file_token = _register_temp_file(path, mime, filename, "attachment")
-        return {
-            "ok": True,
-            "type": "pdf" if mime == "application/pdf" else "binary",
-            "filename": filename,
-            "size": len(content),
-            "expectedSize": expected_size,
-            "mime": mime,
-            "url": f"/files/{file_token}",
-        }
-    except RuntimeError as e:
-        if str(e) == "SUNAT_SESSION_EXPIRED":
-            return JSONResponse(status_code=410, content={
-                "ok": False,
-                "error": "SUNAT_SESSION_EXPIRED",
-                "message": "La sesión SUNAT expiró. Vuelve a iniciar sesión.",
-            })
-        if str(e).startswith("SUNAT_ATTACHMENT_ENDPOINT_NOT_FOUND"):
-            return JSONResponse(status_code=502, content={
-                "ok": False,
-                "error": "SUNAT_ATTACHMENT_ENDPOINT_NOT_FOUND",
-                "message": "No se pudo descubrir el endpoint vigente de descarga del adjunto SUNAT.",
-                "detail": str(e),
-            })
-        logger.exception("[BuzonAdjunto] Error codigoMensaje=%s tipoMsj=%s codArchivo=%s", codigoMensaje, tipoMsj, codArchivo)
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_ATTACHMENT_ERROR", "message": str(e)})
-    except Exception as e:
-        logger.exception("[BuzonAdjunto] Error inesperado codigoMensaje=%s tipoMsj=%s codArchivo=%s", codigoMensaje, tipoMsj, codArchivo)
-        return JSONResponse(status_code=502, content={"ok": False, "error": "SUNAT_ATTACHMENT_ERROR", "message": str(e)})
-
-
-@app.get("/files/{token_archivo}")
-async def serve_temp_file(token_archivo: str, download: int = Query(0)):
-    _cleanup_file_tokens()
-    info = file_tokens.get(token_archivo)
-    if not info:
-        return JSONResponse(status_code=404, content={"ok": False, "error": "FILE_NOT_FOUND"})
-    path = Path(info["path"])
-    try:
-        resolved = path.resolve()
-        tmp_root = SUNAT_BUZON_TMP_DIR.resolve()
-        if tmp_root not in resolved.parents and resolved != tmp_root:
-            logger.error("[Files] Blocked path outside tmp root: %s", resolved)
-            return JSONResponse(status_code=403, content={"ok": False, "error": "FILE_FORBIDDEN"})
-    except Exception:
-        return JSONResponse(status_code=403, content={"ok": False, "error": "FILE_FORBIDDEN"})
-    if not path.exists() or not path.is_file():
-        file_tokens.pop(token_archivo, None)
-        return JSONResponse(status_code=404, content={"ok": False, "error": "FILE_NOT_FOUND"})
-
-    filename = sanitize_filename(info.get("filename") or path.name, path.name)
-    disposition = "attachment" if int(download or 0) == 1 else "inline"
-    return FileResponse(
-        path=str(path),
-        media_type=info.get("mime") or "application/octet-stream",
-        filename=filename,
-        headers={
-            "Content-Disposition": f'{disposition}; filename="{filename}"',
-            "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "private, max-age=0, no-store",
-        },
-    )
-
-
 def _error_html(msg: str) -> str:
     return f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
     <style>
@@ -2743,7 +1983,7 @@ async def sunafil_proxy_create(creds: Credenciales):
 
 @app.post("/buzon/create")
 async def buzon_create(creds: Credenciales):
-    """Login específico para Buzón SOL. Incluye warm-up del visor."""
+    """Login específico para el buzón — incluye warm-up del visor."""
     creds.portal = "buzon"
     return await proxy_create(creds)
 
@@ -2764,12 +2004,6 @@ async def root():
             "GET  /ext-inject/{token}":        "Página para extensión Chrome (inyección de cookies)",
             "GET  /get-cookies/{token}":       "Devuelve cookies raw para extensión",
             "GET  /session-redirect/{token}":  "Redirige con cookies inyectadas (pestaña real)",
-            "GET  /buzon/{token}":             "Lista mensajes del Buzón SOL (compatibilidad Laravel)",
-            "GET  /sunat/buzon/{token}/mensajes": "Lista mensajes del Buzón SOL",
-            "GET  /sunat/buzon/{token}/detalle": "Detalle Buzón SOL con adjuntos normalizados",
-            "GET  /sunat/buzon/{token}/documento-html": "Genera vista HTML interna de documento SUNAT",
-            "GET  /sunat/buzon/{token}/adjunto": "Descarga adjunto SUNAT y retorna URL interna",
-            "GET  /files/{token_archivo}":      "Sirve archivo temporal inline o download=1",
             "POST /session":                   "Devuelve cookies raw (uso avanzado)",
             "GET  /health":                    "Estado del servicio",
         },
@@ -2777,9 +2011,280 @@ async def root():
             "sunat":       "Menú SOL (e-menu.sunat.gob.pe)",
             "declaracion": "Declaración y Pago (api-seguridad.sunat.gob.pe)",
             "sunafil":     "Casilla Electrónica SUNAFIL (casillaelectronica.sunafil.gob.pe)",
-            "buzon":       "Buzón SOL (warm-up visor)",
+            "buzon":      "Buzón SOL (warm-up visor)",
         },
     }
+
+
+@app.get("/buzon/{token}")
+async def buzon_listar(token: str, page: int = 1, todo: bool = False, tipo: int = 2, desde: str = ""):
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    from datetime import datetime as dt
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://ww1.sunat.gob.pe",
+        "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+        "Cookie": cookie_header,
+    }
+
+    # ── Warm-up: visitar el visor para obtener ITVISORNOTISESSION ──
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as warmup_client:
+        warmup_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Referer": "https://e-menu.sunat.gob.pe/cl-ti-itmenu/MenuInternet.htm?pestana=*&agrupacion=*",
+            "Cookie": cookie_header,
+        }
+        # Probar las URLs candidatas del visor hasta encontrar una que funcione
+        for warmup_url in [
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",  # URL real actual
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/",
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/index.jsp",
+        ]:
+            try:
+                wr = await warmup_client.get(warmup_url, headers=warmup_headers)
+                logger.info(f"[Buzon] Warm-up {warmup_url} → {wr.status_code} | cookies nuevas: {list(wr.cookies.keys())}")
+                # Absorber cookies nuevas
+                for name, value in wr.cookies.items():
+                    cookies[name] = value
+                cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                headers["Cookie"] = cookie_header
+                warmup_headers["Cookie"] = cookie_header
+                if wr.status_code == 200:
+                    logger.info(f"[Buzon] Warm-up OK en {warmup_url}")
+                    break
+            except Exception as e:
+                logger.warning(f"[Buzon] Warm-up error: {e}")
+    # ──────────────────────────────────────────────────────────────
+
+    todos_mensajes = []
+    pagina = page
+    data = {}
+    fecha_desde = None
+
+    if desde:
+        try:
+            fecha_desde = dt.strptime(desde, "%Y-%m-%d")
+        except Exception:
+            pass
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
+        while True:
+            params = {
+                "tipoMsj": tipo, "codCarpeta": "00", "codEtiqueta": "",
+                "page": pagina, "des_asunto": "", "codMensaje": "",
+                "tipoOrden": "NADA",
+                "_": str(int(datetime.now().timestamp() * 1000)),
+            }
+            r = await client.get(
+                "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/listNotiMenPag",
+                params=params, headers=headers,
+            )
+
+            logger.info(f"[Buzon] HTTP {r.status_code} | URL final: {r.url}")
+            logger.info(f"[Buzon] Content-Type: {r.headers.get('content-type', '')}")
+            logger.info(f"[Buzon] Respuesta: {r.text[:500]}")
+            logger.info(f"[Buzon] Cookies enviadas: {list(cookies.keys())}")
+
+            data = r.json()
+            rows = data.get("rows")
+
+            if rows is None:
+                return JSONResponse(content={
+                    "ok": False, "error": "rows_null",
+                    "detalle": "Sesión inválida o RUC sin buzón",
+                    "ruc": session.get("ruc"),
+                    "debug": {
+                        "status": r.status_code,
+                        "url_final": str(r.url),
+                        "content_type": r.headers.get("content-type", ""),
+                        "respuesta": r.text[:500],
+                    }
+                })
+
+            # ── Filtrar por fecha si se especificó "desde" ──────────────
+            if fecha_desde:
+                rows_validos = []
+                hay_anteriores = False
+                for m in rows:
+                    try:
+                        fec = dt.strptime(m.get("fecEnvio", "01/01/1900"), "%d/%m/%Y")
+                        if fec >= fecha_desde:
+                            rows_validos.append(m)
+                        else:
+                            hay_anteriores = True
+                    except Exception:
+                        rows_validos.append(m)
+                todos_mensajes.extend(rows_validos)
+                # Si encontramos mensajes anteriores → parar paginación
+                if hay_anteriores:
+                    break
+            else:
+                todos_mensajes.extend(rows)
+            # ────────────────────────────────────────────────────────────
+
+            if not todo or len(rows) < 25:
+                break
+            pagina += 1
+
+    return {
+        "ok": True,
+        "ruc": session.get("ruc"),
+        "total_obtenidos": len(todos_mensajes),
+        "total_buzon": data.get("records", 0),
+        "pagina": pagina,
+        "mensajes": todos_mensajes,
+    }
+
+
+@app.get("/buzon/{token}/detalle/{codigo_mensaje}")
+async def buzon_detalle(token: str, codigo_mensaje: int):
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://ww1.sunat.gob.pe",
+        "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+        "Cookie": cookie_header,
+    }
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, verify=False) as client:
+        r = await client.get(
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerDetalleNotiMen",
+            params={
+                "codigoMensaje": codigo_mensaje, "tipoMsj": 2,
+                "_": str(int(datetime.now().timestamp() * 1000)),
+            },
+            headers=headers,
+        )
+    data = r.json()
+
+    msj_raw = data.get("msjMensaje", "")
+    if msj_raw and isinstance(msj_raw, str):
+        try:
+            data["msjMensaje_parsed"] = json.loads(msj_raw)
+        except Exception:
+            data["msjMensaje_parsed"] = msj_raw
+
+    adjuntos = data.get("listAttach", [])
+    data["adjuntos_clasificados"] = {
+        "documento_html": next(
+            ({"numId": a.get("numId")} for a in adjuntos if str(a.get("indMensaje")) == "3"),
+            None
+        ),
+        "archivos_pdf": [
+            {
+                "codArchivo": a.get("codArchivo"),
+                "nomArchivo": a.get("nomArchivo"),
+                "tamano": a.get("tamanoArchivoFormat"),
+                "bytes": a.get("cntTamarch"),
+            }
+            for a in adjuntos if str(a.get("indMensaje")) == "2"
+        ],
+    }
+
+    return {"ok": True, "ruc": session.get("ruc"), "detalle": data}
+
+
+@app.get("/buzon/{token}/documento/{cod_mensaje}")
+async def buzon_documento(token: str, cod_mensaje: int):
+    """Descarga el documento HTML principal del mensaje."""
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    headers_base = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+        "Cookie": cookie_header,
+    }
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30, verify=False) as client:
+        # Obtener detalle para sacar la URL del documento
+        r = await client.get(
+            "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerDetalleNotiMen",
+            params={"codigoMensaje": cod_mensaje, "tipoMsj": 2,
+                    "_": str(int(datetime.now().timestamp() * 1000))},
+            headers={**headers_base, "Accept": "application/json, text/javascript, */*; q=0.01",
+                     "X-Requested-With": "XMLHttpRequest"},
+        )
+        detalle = r.json()
+        url_doc = detalle.get("url", "")
+
+        if not url_doc:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "sin_url_documento"})
+
+        full_url = f"https://ww1.sunat.gob.pe{url_doc}" if url_doc.startswith("/") else url_doc
+        rd = await client.get(full_url, headers={
+            **headers_base,
+            "Accept": "text/html,application/xhtml+xml,*/*",
+        })
+
+    return Response(
+        content=rd.content,
+        media_type=rd.headers.get("content-type", "text/html"),
+        headers={"Content-Disposition": f"inline; filename=doc_{cod_mensaje}.html"},
+    )
+
+
+@app.get("/buzon/{token}/pdf/{cod_mensaje}/{cod_archivo}")
+async def buzon_pdf(token: str, cod_mensaje: int, cod_archivo: int):
+    """Descarga el PDF adjunto de un mensaje."""
+    session = proxy_sessions.get(token)
+    if not session:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "token_not_found"})
+    if session["expires_at"] <= datetime.now():
+        return JSONResponse(status_code=410, content={"ok": False, "error": "expired"})
+
+    cookies = {c["name"]: c["value"] for c in session["cookies"]}
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    url = (
+        f"https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/obtenerArchivo"
+        f"?codArchivo={cod_archivo}&nomArchivo=adjunto_{cod_mensaje}"
+    )
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30, verify=False) as client:
+        r = await client.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/pdf,application/octet-stream,*/*",
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Referer": "https://ww1.sunat.gob.pe/ol-ti-itvisornoti/visor/master",
+            "Cookie": cookie_header,
+        })
+
+    nom = f"doc_{cod_mensaje}_{cod_archivo}.pdf"
+    return Response(
+        content=r.content,
+        media_type=r.headers.get("content-type", "application/pdf"),
+        headers={"Content-Disposition": f"attachment; filename={nom}"},
+    )
 
 
 if __name__ == "__main__":
